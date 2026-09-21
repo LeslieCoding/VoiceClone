@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 虚拟环境与模型（体积大，不进仓库）
+venv/
+models/
+
+# 工具二进制
+tools/ffmpeg-bin/
+
+# 运行产物
+output/
+download_checks.json
+
+# 基准测试数据与临时产物
+test/bench*/
+test/__pycache__/
+*.wav
+!test/tony_30s.wav
+
+# 原始音源素材
+Voice Orginal/
