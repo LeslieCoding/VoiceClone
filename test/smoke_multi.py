@@ -19,11 +19,14 @@ sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
 PYTHON = os.path.join(PROJECT_ROOT, "venv", "Scripts", "python.exe")
 
-# 1. 准备两个测试音源
+# 1. 准备 N 个测试音源（默认 2 个，可用命令行参数指定，如 python test/smoke_multi.py 4）
+N = int(sys.argv[1]) if len(sys.argv) > 1 else 2
 src = os.path.join("test", "tony_30s.wav")
-fa, fb = os.path.abspath("test/multi_a.wav"), os.path.abspath("test/multi_b.wav")
-shutil.copyfile(src, fa)
-shutil.copyfile(src, fb)
+files = []
+for i in range(N):
+    dst = os.path.abspath(f"test/multi_{chr(97+i)}.wav")
+    shutil.copyfile(src, dst)
+    files.append(dst)
 
 # 2. 清空产物目录
 for d in ("output/slicer_opt", "output/asr_opt", "output/uvr5_opt", "output/dereverb_opt"):
@@ -35,7 +38,7 @@ proc = subprocess.Popen(
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     text=True, encoding="utf-8", errors="replace", bufsize=1,
     env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1"))
-proc.stdin.write(f'3\n"{fa}" "{fb}"\nn\n')
+proc.stdin.write("3\n" + " ".join(f'"{f}"' for f in files) + "\nn\n")
 proc.stdin.flush()
 
 q = queue.Queue()
@@ -81,16 +84,14 @@ proc.stdin.write("0\n")
 proc.stdin.flush()
 proc.wait(timeout=30)
 
-# 6. 验证：两个音源都有切片，标注文件合并包含两者
-wa = glob.glob("output/slicer_opt/multi_a_clean_s*.wav")
-wb = glob.glob("output/slicer_opt/multi_b_clean_s*.wav")
-print(f"[smoke] multi_a 切片 {len(wa)} 个，multi_b 切片 {len(wb)} 个")
-assert wa, "multi_a 没有切片！"
-assert wb, "multi_b 没有切片！"
-
+# 6. 验证：每个音源都有切片，标注文件合并包含全部
 final_entries = annotate.load_list(os.path.abspath("output/asr_opt/slicer_opt.list"))
 paths = [e[0] for e in final_entries]
-assert any("multi_a" in p for p in paths), "标注文件缺少 multi_a 条目"
-assert any("multi_b" in p for p in paths), "标注文件缺少 multi_b 条目"
-print(f"[smoke] 标注文件共 {len(final_entries)} 条，两个音源都在")
-print("[smoke] 多音源批量处理全链路通过")
+for f in files:
+    stem = os.path.splitext(os.path.basename(f))[0]
+    n = len(glob.glob(f"output/slicer_opt/{stem}_clean_s*.wav"))
+    print(f"[smoke] {stem} 切片 {n} 个")
+    assert n > 0, f"{stem} 没有切片！"
+    assert any(stem in p for p in paths), f"标注文件缺少 {stem} 条目"
+print(f"[smoke] 标注文件共 {len(final_entries)} 条，{N} 个音源都在")
+print(f"[smoke] {N} 个音源批量处理全链路通过")
