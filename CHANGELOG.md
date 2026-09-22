@@ -1,5 +1,41 @@
 # 更新日志
 
+## v3.0.0（2026-09-23）
+
+**重大变更：合成后端从 F5-TTS 零样本克隆换成 GPT-SoVITS v4 训练版。**
+零样本克隆音色保真度不够（不像本人），训练出专属权重才是音色准确的正路。
+
+### 架构变更
+
+- GPT-SoVITS 官方源码入驻 `gsv/`（含全部必要补丁），完全自包含，不依赖桌面上的旧项目文件夹。
+- 新增 `gsv_backend.py` 后端模块：格式化（1Aa BERT 文本特征 / 1Ab cnhubert 特征 / 1Ac 语义 token）、SoVITS v4 LoRA 训练、GPT 训练、训练权重推理，全部终端实时进度。
+- 推理网页重写：选自己训练的 SoVITS/GPT 权重（默认最新）→ 选参考音 → 输文本 → 合成。
+- 菜单重排：1 网页推理 / 2 终端推理 / 3 模型训练 / 4 数据准备 / 5 标注校对 / 0 退出。
+
+### 电音防线（训练前/中/后三层）
+
+- **训练前**：数据质量门 `quality_gate`——自动剔除过短/过长/静音/削波的坏切片（prepare 标注后和 format 前各执行一次）。
+- **训练中**：`PYTORCH_CUDA_ALLOC_CONF=expandable_segments` 防显存碎片；batch 默认值按 16G 显存调优（SoVITS 6 / GPT 4）。
+- **推理后**：CFM 采样步数默认 64（官方 32 有电音感）；输出统一过 后处理（20Hz 高通去直流 + 16kHz 低通去噪点 + 软限幅 + 峰值归一）。
+
+### 上游补丁（打在 gsv/ 源码上）
+
+- `s1_train.py`：单卡不走 DDP/gloo（Windows torch≥2.9 原生崩溃 0xC0000005）；`add_safe_globals` 兼容 torch≥2.6 断点加载。
+- `AR/data/bucket_sampler.py`：分布式采样器加 `dist.is_initialized()` 守卫。
+- `AR/data/data_module.py`：`num_workers=0` 时不再传 `persistent_workers/prefetch_factor`（直接报错）。
+- 参考音频挑选窗口改为 3~10 秒（v4 推理硬性要求），网页端自动隐藏超范围切片。
+
+### 修复的问题（端到端实测中发现）
+
+- 权重保存目录不存在导致 SoVITS 权重保存失败 → 训练前自动创建。
+- TTS 推理类按 CWD 相对路径找 v4 底模/声码器 → 建 `GPT_SoVITS` 目录联接（junction）指到 `gsv/GPT_SoVITS`。
+- v4 LoRA 底模检查、G2PW 拼音模型（589MB）、fasttext 语种模型（lid.176.bin）全部预置离线可用。
+
+### 测试
+
+- 单元测试 44 项全绿（新增后处理/质量门/权重扫描测试，移除 F5 专属测试）。
+- 端到端实测：16 切片 → 格式化三连 → SoVITS/GPT 各训 1 轮 → 权重保存 → 终端合成 → 网页合成（含空文本拦截），全链路通过。
+
 ## v2.2.0（2026-09-22）
 
 ### 修复的缺陷

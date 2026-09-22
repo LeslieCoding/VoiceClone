@@ -23,3 +23,13 @@ test/__pycache__/
 
 # 原始音源素材
 Voice Orginal/
+/GPT_SoVITS
+
+# GPT-SoVITS 后端：模型与训练产物（体积大，不进仓库）
+/GPT_SoVITS
+gsv/GPT_SoVITS/pretrained_models/
+gsv/GPT_SoVITS/text/G2PWModel/
+gsv/TEMP/
+logs/
+SoVITS_weights_v4/
+GPT_weights_v4/

@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-# VoiceClone 零样本语音克隆流水线（基于 F5-TTS，2025 新一代架构）：
-#   数据准备：MelBand RoFormer 人声分离 -> 去混响 -> 语音切分 -> faster-whisper 识别 -> 标注确认
-#   推理合成：F5-TTS 零样本克隆（无需训练，给一段参考音直接合成；vocos 声码器，无电音）
-# 完全自包含，不依赖任何外部项目。用法见各子命令 --help，推荐双击 go-vc.bat 启动。
+# VoiceClone 语音克隆流水线（GPT-SoVITS v4 训练版）：
+#   数据准备：MelBand RoFormer 人声分离 -> 去混响 -> 句子级切分 -> faster-whisper 识别 -> 标注确认
+#   模型训练：格式化（BERT/cnhubert/语义 token）-> SoVITS LoRA 训练 -> GPT 训练
+#   推理合成：用训练出的权重克隆音色（音色准），全程电音防线（数据质量门 + 采样64步 + 输出后处理）
+# GPT-SoVITS 源码在 gsv/（含单卡训练补丁），完全自包含。用法见各子命令 --help，推荐双击 go-vc.bat。
 import argparse
 import glob
 import os
@@ -45,8 +46,6 @@ DEREVERB_DIR = os.path.abspath("output/dereverb_opt")
 TTS_DIR = os.path.abspath("output/tts")
 DEFAULT_LIST = os.path.join(ASR_DIR, "slicer_opt.list")
 SUBFIX_PORT = 9871
-
-F5_MODEL = "F5TTS_v1_Base"  # 中英双语零样本克隆模型
 
 
 def die(msg, code=1):
@@ -110,10 +109,51 @@ def cmd_prepare(args):
     check_file(DEFAULT_LIST, "ASR 标注文件(.list)")
     annotate.run_annotator(DEFAULT_LIST, port=SUBFIX_PORT)
 
+    # 数据质量门（电音防线）：剔除过短/静音/削波的坏切片
+    import gsv_backend as gb
+    kept, dropped = gb.quality_gate(DEFAULT_LIST)
+    if dropped:
+        print(f"\n质量门剔除了 {len(dropped)} 个不合格切片：")
+        for name, reason in dropped:
+            print(f"  - {name}: {reason}")
+    print(f"质量门通过 {kept} 个切片。")
+
     st.next("完成")
-    n_total = len(annotate.load_list(DEFAULT_LIST))
-    print(f"数据准备完成！标注文件共 {n_total} 个句子片段: {DEFAULT_LIST}")
-    print("接下来可直接运行推理: vc.py infer")
+    print(f"数据准备完成！标注文件: {DEFAULT_LIST}")
+    print("接下来运行模型训练: vc.py train（或菜单选 4）")
+
+
+# ---------------------------------------------------------------- 模型训练（格式化 + SoVITS + GPT）
+
+def cmd_format(args):
+    import gsv_backend as gb
+    list_path = check_file(DEFAULT_LIST, "标注文件(.list)")
+    kept, dropped = gb.quality_gate(list_path)
+    if dropped:
+        print(f"质量门再次剔除 {len(dropped)} 个不合格切片（剩 {kept} 个）。")
+    if kept < 2:
+        die(f"可用切片太少（{kept} 个），请先多做些数据准备（菜单选 3）")
+    print(f"实验名: {args.exp}，共 {kept} 个训练切片")
+    gb.run_format(args.exp, list_path, SLICER_DIR)
+    print(f"\n格式化完成，产物在 logs/{args.exp}/")
+
+
+def cmd_train(args):
+    import gsv_backend as gb
+    exp_dir = os.path.join("logs", args.exp)
+    # 格式化产物不存在则自动先跑格式化（一键到底，不用分两步）
+    need_format = not (os.path.isfile(os.path.join(exp_dir, "2-name2text.txt"))
+                       and os.path.isfile(os.path.join(exp_dir, "6-name2semantic.tsv")))
+    if need_format:
+        print("格式化产物不存在，先自动执行格式化（1Aa/1Ab/1Ac）...")
+        cmd_format(args)
+    gb.run_train(args.exp, sovits_epochs=args.sovits_epochs, sovits_batch=args.sovits_batch,
+                 gpt_epochs=args.gpt_epochs, gpt_batch=args.gpt_batch,
+                 lora_rank=args.lora_rank,
+                 sovits_only=args.sovits_only, gpt_only=args.gpt_only)
+    sovits_list, gpt_list = gb.scan_weights()
+    print(f"\n训练完成！SoVITS 权重 {len(sovits_list)} 个，GPT 权重 {len(gpt_list)} 个")
+    print("接下来运行推理: vc.py infer（或菜单选 1/2）")
 
 
 def _prepare_one(src, args, append_list=False):
@@ -161,8 +201,8 @@ def wav_duration(path):
         return 0.0
 
 
-def pick_reference(list_path, min_sec=4.0, max_sec=15.0):
-    """从 .list 标注中自动挑选最优参考音：时长 4~15 秒、文本非空，优先 8~12 秒"""
+def pick_reference(list_path, min_sec=3.0, max_sec=10.0):
+    """从 .list 标注中自动挑选最优参考音：时长 3~10 秒（v4 推理硬性要求）、文本非空，优先 5~9 秒"""
     entries = []
     with open(list_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -180,15 +220,15 @@ def pick_reference(list_path, min_sec=4.0, max_sec=15.0):
     for wav, text in entries:
         dur = wav_duration(wav)
         if min_sec <= dur <= max_sec:
-            # 8~12 秒最优，其余按偏离度扣分
-            ideal = 0.0 if 8.0 <= dur <= 12.0 else min(abs(dur - 8.0), abs(dur - 12.0))
+            # 5~9 秒最优，其余按偏离度扣分
+            ideal = 0.0 if 5.0 <= dur <= 9.0 else min(abs(dur - 5.0), abs(dur - 9.0))
             scored.append((ideal, -dur, wav, text, dur))
     if not scored:
         # 没有合格时放宽到最接近期望区间的
-        cand = [(abs(wav_duration(w) - 10.0), w, t, wav_duration(w)) for w, t in entries]
+        cand = [(abs(wav_duration(w) - 7.0), w, t, wav_duration(w)) for w, t in entries]
         cand.sort()
         _, wav, text, dur = cand[0]
-        print(f"提示：没有 4~15 秒的切片，改用时长最接近 10 秒的: {os.path.basename(wav)} ({dur:.1f}s)")
+        print(f"提示：没有 3~10 秒的切片，改用时长最接近 7 秒的: {os.path.basename(wav)} ({dur:.1f}s)")
         return wav, text
     scored.sort()
     _, _, wav, text, dur = scored[0]
@@ -196,58 +236,42 @@ def pick_reference(list_path, min_sec=4.0, max_sec=15.0):
     return wav, text
 
 
-# ---------------------------------------------------------------- 推理合成
+# ---------------------------------------------------------------- 推理合成（GPT-SoVITS v4 训练权重）
 
-def load_f5(model_name):
-    from f5_tts.api import F5TTS
-    print(f"正在加载 {model_name}（首次运行会从 hf-mirror 下载模型，约 1.3GB）...")
-    return F5TTS(model=model_name)
-
-
-def synth(f5, ref_file, ref_text, gen_text, out_path, nfe_step=32, cfg_strength=2.0, speed=1.0, seed=-1):
-    import soundfile as sf
-    # F5-TTS 内部 ODE 采样器偶发 "t must be strictly increasing" 断言（上游已知数值边界），
-    # 遇到时换随机种子自动重试，最多 3 次
-    last_err = None
-    for attempt in range(3):
-        try:
-            use_seed = seed if (attempt == 0 and seed >= 0) else None  # None = F5 内部随机
-            wav, sr, _ = f5.infer(
-                ref_file=ref_file, ref_text=ref_text, gen_text=gen_text,
-                nfe_step=nfe_step, cfg_strength=cfg_strength, speed=speed, seed=use_seed,
-            )
-            break
-        except AssertionError as e:
-            if "strictly increasing" in str(e):
-                last_err = e
-                print(f"[提示] 采样器偶发断言（第 {attempt+1}/3 次），换随机种子重试...", flush=True)
-                continue
-            raise
-    else:
-        raise last_err
-    sf.write(out_path, wav, sr)
-    return out_path
+def _pick_weights(args):
+    """选定 SoVITS/GPT 权重：命令行指定 > 自动取最新"""
+    import gsv_backend as gb
+    sovits_list, gpt_list = gb.scan_weights()
+    if not sovits_list or not gpt_list:
+        die("还没有训练出的模型权重。请先完成训练：vc.py train（或菜单选 4）")
+    sovits_path = os.path.abspath(args.sovits) if getattr(args, "sovits", None) else sovits_list[-1]
+    gpt_path = os.path.abspath(args.gpt) if getattr(args, "gpt", None) else gpt_list[-1]
+    check_file(sovits_path, "SoVITS 权重")
+    check_file(gpt_path, "GPT 权重")
+    print(f"SoVITS 权重: {sovits_path}\nGPT 权重:    {gpt_path}")
+    return sovits_path, gpt_path
 
 
 def cmd_infer(args):
-    list_path = args.list or DEFAULT_LIST
+    import soundfile as sf
+    import gsv_backend as gb
 
+    list_path = args.list or DEFAULT_LIST
     if args.ref:
         ref_file = check_file(args.ref, "参考音频")
         ref_text = args.ref_text
         if ref_text is None and os.path.isfile(list_path):
             ref_text = find_text_in_list(list_path, ref_file) or ""
-            if not ref_text:
-                print("提示：未在标注文件中找到该音频的文本，ref_text 为空（F5-TTS 可自动识别，但显式文本更准）")
         if ref_text is None:
             ref_text = ""
     else:
         if not os.path.isfile(list_path):
-            die(f"标注文件不存在: {list_path}\n请先运行: vc.py prepare <音源文件>（或用 --ref 显式指定参考音频）")
+            die(f"标注文件不存在: {list_path}\n请先运行数据准备（菜单选 3），或用 --ref 显式指定参考音频")
         ref_file, ref_text = pick_reference(list_path)
 
+    sovits_path, gpt_path = _pick_weights(args)
     os.makedirs(TTS_DIR, exist_ok=True)
-    f5 = load_f5(args.model)
+    tts = gb.GsvTTS(sovits_path, gpt_path)
 
     texts = list(args.text or [])
     if not texts:
@@ -275,8 +299,9 @@ def cmd_infer(args):
 
         out_path = os.path.join(TTS_DIR, f"tts_{idx:04d}.wav")
         print("合成中...", flush=True)
-        synth(f5, ref_file, ref_text, gen_text, out_path,
-              nfe_step=args.steps, cfg_strength=args.cfg, speed=args.speed, seed=args.seed)
+        sr, audio = tts.synth(gen_text, ref_file, ref_text,
+                              sample_steps=args.steps, speed_factor=args.speed, seed=args.seed)
+        sf.write(out_path, audio, sr)
         idx += 1
         print(f"已保存: {out_path}\n")
         if args.text:
@@ -313,16 +338,15 @@ def cmd_ui(args):
 
 def cmd_all(args):
     cmd_prepare(args)
-    print("\n数据准备完成，直接进入推理合成。")
-    args.list = DEFAULT_LIST
-    args.ref = None
-    args.ref_text = None
-    args.text = None
-    args.steps = 32
-    args.cfg = 2.0
-    args.speed = 1.0
-    args.seed = -1
-    cmd_infer(args)
+    print("\n数据准备完成，进入模型训练。")
+    train_args = argparse.Namespace(exp=args.exp, sovits_epochs=8, sovits_batch=6,
+                                    gpt_epochs=15, gpt_batch=4, lora_rank=32,
+                                    sovits_only=False, gpt_only=False)
+    cmd_train(train_args)
+    print("\n训练完成，进入推理合成。")
+    infer_args = argparse.Namespace(list=DEFAULT_LIST, ref=None, ref_text=None, text=None,
+                                    sovits=None, gpt=None, steps=64, speed=1.0, seed=-1)
+    cmd_infer(infer_args)
 
 
 # ---------------------------------------------------------------- 向导菜单
@@ -344,15 +368,16 @@ def split_dropped_paths(line):
 def wizard():
     while True:
         print("\n" + "=" * 50)
-        print("  VoiceClone 零样本语音克隆（F5-TTS）")
+        print("  VoiceClone 语音克隆（GPT-SoVITS v4 训练版）")
         print("=" * 50)
-        print("  1) 推理合成（终端直接合成，无需训练）")
-        print("  2) 打开推理合成网页版（在浏览器里合成，界面更直观）")
-        print("  3) 数据准备（新音源用：人声分离 → 去混响 → 切分 → 识别 → 标注）")
-        print("  4) 只打开标注校对页（切分和识别已完成、只需校对时用）")
+        print("  1) 推理合成（打开网页：选权重、选参考音、输文本）")
+        print("  2) 推理合成（终端直接合成，自动选最新权重）")
+        print("  3) 模型训练（格式化 + SoVITS 训练 + GPT 训练，终端看进度）")
+        print("  4) 数据准备（新音源：人声分离 → 去混响 → 切分 → 识别 → 标注）")
+        print("  5) 只打开标注校对页（切分和识别已完成、只需校对时用）")
         print("  0) 退出")
         try:
-            choice = input("\n请选择 [0-4]: ").strip()
+            choice = input("\n请选择 [0-5]: ").strip()
         except EOFError:
             return
 
@@ -360,12 +385,18 @@ def wizard():
             return
         try:
             if choice == "1":
-                args = argparse.Namespace(list=None, ref=None, ref_text=None, text=None,
-                                          model=F5_MODEL, steps=32, cfg=2.0, speed=1.0, seed=-1)
-                cmd_infer(args)
-            elif choice == "2":
                 cmd_ui(argparse.Namespace(port=None, share=False))
+            elif choice == "2":
+                args = argparse.Namespace(list=None, ref=None, ref_text=None, text=None,
+                                          sovits=None, gpt=None, steps=64, speed=1.0, seed=-1)
+                cmd_infer(args)
             elif choice == "3":
+                exp = input("实验名称（回车默认 exp1，权重按此名保存）: ").strip() or "exp1"
+                args = argparse.Namespace(exp=exp, sovits_epochs=8, sovits_batch=6,
+                                          gpt_epochs=15, gpt_batch=4, lora_rank=32,
+                                          sovits_only=False, gpt_only=False)
+                cmd_train(args)
+            elif choice == "4":
                 srcs = split_dropped_paths(input("请输入音源文件路径（可一次拖入多个文件）: "))
                 if not srcs:
                     print("未输入路径。")
@@ -383,7 +414,7 @@ def wizard():
                 pure = input("音源是否已是纯人声（无背景音乐）？[y/N]: ").strip().lower() == "y"
                 args = argparse.Namespace(source=srcs, skip_uvr=pure, whisper_model="large-v3-turbo")
                 cmd_prepare(args)
-            elif choice == "4":
+            elif choice == "5":
                 import annotate
                 list_path = check_file(DEFAULT_LIST, "标注文件(.list)")
                 annotate.run_annotator(list_path, port=SUBFIX_PORT)
@@ -400,7 +431,7 @@ def wizard():
 # ---------------------------------------------------------------- 入口
 
 def main():
-    p = argparse.ArgumentParser(prog="vc.py", description="VoiceClone 零样本语音克隆流水线")
+    p = argparse.ArgumentParser(prog="vc.py", description="VoiceClone 语音克隆流水线（GPT-SoVITS v4 训练版）")
     sub = p.add_subparsers(dest="command")
 
     p_prepare = sub.add_parser("prepare", help="数据准备（分离/去混响/切分/识别/标注）")
@@ -409,32 +440,45 @@ def main():
     p_prepare.add_argument("--whisper-model", default="large-v3-turbo",
                            help="Whisper 识别模型（默认 large-v3-turbo，可换 large-v3）")
 
-    p_infer = sub.add_parser("infer", help="推理合成（零样本克隆）")
+    p_train = sub.add_parser("train", help="模型训练（自动格式化 + SoVITS 训练 + GPT 训练）")
+    p_train.add_argument("--exp", default="exp1", help="实验名（默认 exp1，权重按此名保存）")
+    p_train.add_argument("--sovits-epochs", type=int, default=8, help="SoVITS 训练轮数（默认 8）")
+    p_train.add_argument("--sovits-batch", type=int, default=6, help="SoVITS batch size（默认 6，16G 显存适用）")
+    p_train.add_argument("--gpt-epochs", type=int, default=15, help="GPT 训练轮数（默认 15）")
+    p_train.add_argument("--gpt-batch", type=int, default=4, help="GPT batch size（默认 4，16G 显存适用）")
+    p_train.add_argument("--lora-rank", type=int, default=32, help="LoRA 秩（默认 32）")
+    p_train.add_argument("--sovits-only", action="store_true", help="只训 SoVITS")
+    p_train.add_argument("--gpt-only", action="store_true", help="只训 GPT")
+
+    p_infer = sub.add_parser("infer", help="推理合成（用训练出的权重克隆音色）")
     p_infer.add_argument("--list", help=f"标注文件路径（默认 {DEFAULT_LIST}）")
     p_infer.add_argument("--ref", help="参考音频路径（默认从标注文件自动挑选最优切片）")
     p_infer.add_argument("--ref-text", help="参考音频文本（默认自动从标注文件查找）")
+    p_infer.add_argument("--sovits", help="SoVITS 权重路径（默认最新）")
+    p_infer.add_argument("--gpt", help="GPT 权重路径（默认最新）")
     p_infer.add_argument("--text", action="append", help="要合成的文本（可多次指定；不指定则进入交互输入）")
-    p_infer.add_argument("--model", default=F5_MODEL, help=f"F5-TTS 模型名（默认 {F5_MODEL}）")
-    p_infer.add_argument("--steps", type=int, default=32, help="采样步数 NFE（默认 32，越大越精细越慢）")
-    p_infer.add_argument("--cfg", type=float, default=2.0, help="CFG 强度（默认 2.0）")
+    p_infer.add_argument("--steps", type=int, default=64, help="CFM 采样步数（默认 64，低了有电音）")
     p_infer.add_argument("--speed", type=float, default=1.0, help="语速（默认 1.0）")
     p_infer.add_argument("--seed", type=int, default=-1, help="随机种子（-1 随机）")
 
-    p_ui = sub.add_parser("ui", help="打开 F5-TTS 网页版界面")
+    p_ui = sub.add_parser("ui", help="打开推理合成网页（选权重、选参考音、输文本）")
     p_ui.add_argument("--port", type=int, help="网页端口（默认自动分配）")
     p_ui.add_argument("--share", action="store_true", help="生成公网分享链接")
 
     p_anno = sub.add_parser("annotate", help="只打开标注校对页（切片和识别已完成时使用，避免重跑）")
     p_anno.add_argument("--list", help=f"标注文件路径（默认 {DEFAULT_LIST}）")
 
-    p_all = sub.add_parser("all", help="一条龙（数据准备 + 推理合成）")
-    p_all.add_argument("source", help="音源文件路径")
+    p_all = sub.add_parser("all", help="一条龙（数据准备 + 训练 + 推理合成）")
+    p_all.add_argument("source", nargs="+", help="音源文件路径（可多个）")
     p_all.add_argument("--skip-uvr", action="store_true", help="输入已是纯人声")
     p_all.add_argument("--whisper-model", default="large-v3-turbo", help="Whisper 识别模型")
+    p_all.add_argument("--exp", default="exp1", help="实验名（默认 exp1）")
 
     args = p.parse_args()
     if args.command == "prepare":
         cmd_prepare(args)
+    elif args.command == "train":
+        cmd_train(args)
     elif args.command == "infer":
         cmd_infer(args)
     elif args.command == "ui":

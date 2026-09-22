@@ -258,9 +258,9 @@ class TestPickReference:
         lp.write_text("\n".join(lines), encoding="utf-8")
         return str(lp)
 
-    def test_prefers_8_to_12s(self, tmp_path):
+    def test_prefers_5_to_9s(self, tmp_path):
         import vc
-        lp = self._mklist(tmp_path, [2.0, 10.0, 14.0])
+        lp = self._mklist(tmp_path, [2.0, 7.0, 14.0])
         wav, text = vc.pick_reference(lp)
         assert "r1" in wav
 
@@ -285,50 +285,80 @@ class TestPickReference:
             vc.pick_reference(str(lp))
 
 
-class TestSynthRetry:
-    def test_retries_on_ode_assert(self, tmp_path):
-        import vc
+class TestAntiAliasing:
+    def test_removes_dc_and_limits_peak(self):
+        import gsv_backend as gb
+        sr = 32000
+        t = np.arange(sr) / sr
+        audio = (0.5 * np.sin(2 * np.pi * 440 * t) + 0.3).astype(np.float32)  # 带直流偏移
+        out = gb.anti_aliasing_postprocess(audio, sr)
+        assert out.dtype == np.float32
+        assert abs(float(np.mean(out))) < 0.01, "直流偏移没去掉"
+        assert float(np.max(np.abs(out))) <= 0.951, "峰值没限制住"
 
-        class FakeF5:
-            def __init__(self):
-                self.calls = 0
+    def test_empty_input_safe(self):
+        import gsv_backend as gb
+        out = gb.anti_aliasing_postprocess(np.zeros(0, dtype=np.float32), 32000)
+        assert len(out) == 0
 
-            def infer(self, **kw):
-                self.calls += 1
-                if self.calls == 1:
-                    raise AssertionError("t must be strictly increasing or decreasing")
-                return np.zeros(24000, dtype=np.float32), 24000, None
+    def test_sine_survives(self):
+        import gsv_backend as gb
+        sr = 32000
+        t = np.arange(sr) / sr
+        audio = (0.8 * np.sin(2 * np.pi * 440 * t)).astype(np.float32)
+        out = gb.anti_aliasing_postprocess(audio, sr)
+        # 440Hz 在通带内，相关度应很高
+        corr = float(np.corrcoef(audio[1000:-1000], out[1000:-1000])[0, 1])
+        assert corr > 0.95
 
-        f5 = FakeF5()
-        out = tmp_path / "o.wav"
-        vc.synth(f5, "ref.wav", "txt", "合成文本", str(out))
-        assert f5.calls == 2 and os.path.isfile(out)
 
-    def test_real_assert_propagates(self, tmp_path):
-        import vc
+class TestQualityGate:
+    def _mk(self, tmp_path, name, dur=5.0, amp=0.3, clip=False):
+        sr = 32000
+        t = np.arange(int(sr * dur)) / sr
+        data = (amp * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        if clip:
+            data = np.clip(data * 10, -1, 1)
+        p = tmp_path / name
+        sf.write(str(p), data, sr)
+        return str(p)
 
-        class FakeF5:
-            def infer(self, **kw):
-                raise AssertionError("别的断言")
+    def _list(self, tmp_path, wavs):
+        lp = tmp_path / "q.list"
+        lp.write_text("\n".join(f"{w}|spk|ZH|文本" for w in wavs), encoding="utf-8")
+        return str(lp)
 
-        with pytest.raises(AssertionError):
-            vc.synth(FakeF5(), "ref.wav", "t", "g", str(tmp_path / "o.wav"))
+    def test_drops_silent_clipped_short_missing(self, tmp_path):
+        import gsv_backend as gb
+        good = self._mk(tmp_path, "good.wav")
+        silent = self._mk(tmp_path, "silent.wav", amp=0.0001)
+        clipped = self._mk(tmp_path, "clip.wav", clip=True)
+        short = self._mk(tmp_path, "short.wav", dur=0.3)
+        missing = str(tmp_path / "nope.wav")
+        lp = self._list(tmp_path, [good, silent, clipped, short, missing])
+        kept, dropped = gb.quality_gate(lp)
+        assert kept == 1
+        assert len(dropped) == 4
+        # list 文件只剩好的那条
+        content = open(lp, encoding="utf-8").read()
+        assert "good.wav" in content and "silent.wav" not in content
 
-    def test_gives_up_after_3(self, tmp_path):
-        import vc
 
-        class FakeF5:
-            def __init__(self):
-                self.calls = 0
-
-            def infer(self, **kw):
-                self.calls += 1
-                raise AssertionError("t must be strictly increasing or decreasing")
-
-        f5 = FakeF5()
-        with pytest.raises(AssertionError):
-            vc.synth(f5, "r.wav", "t", "g", str(tmp_path / "o.wav"))
-        assert f5.calls == 3
+class TestScanWeights:
+    def test_natural_sort_and_dirs(self, tmp_path, monkeypatch):
+        import gsv_backend as gb
+        sd, gd = tmp_path / "sov", tmp_path / "gpt"
+        sd.mkdir(); gd.mkdir()
+        for n in ("exp_e10_s100_l32.pth", "exp_e2_s20_l32.pth", "exp_e1_s9_l32.pth"):
+            (sd / n).write_bytes(b"x")
+        for n in ("exp-e15.ckpt", "exp-e5.ckpt"):
+            (gd / n).write_bytes(b"x")
+        monkeypatch.setattr(gb, "SOVITS_WEIGHTS_DIR", str(sd))
+        monkeypatch.setattr(gb, "GPT_WEIGHTS_DIR", str(gd))
+        sovits, gpts = gb.scan_weights()
+        assert [os.path.basename(p) for p in sovits] == [
+            "exp_e1_s9_l32.pth", "exp_e2_s20_l32.pth", "exp_e10_s100_l32.pth"]
+        assert [os.path.basename(p) for p in gpts] == ["exp-e5.ckpt", "exp-e15.ckpt"]
 
 
 class TestFindTextInList:
