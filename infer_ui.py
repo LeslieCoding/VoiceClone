@@ -65,6 +65,12 @@ def run_ui(list_path, tts_dir, port=9873):
                 return text
         return ""
 
+    def lang_of(ref_path):
+        for path, _, lang, _ in get_entries():
+            if path == ref_path:
+                return (lang or "zh").lower()
+        return "zh"
+
     def load_tts(sovits_path, gpt_path):
         key = (sovits_path, gpt_path)
         if state["key"] != key:
@@ -83,6 +89,7 @@ def run_ui(list_path, tts_dir, port=9873):
             tts = load_tts(sovits_path, gpt_path)
             import soundfile as sf
             sr, audio = tts.synth(gen_text.strip(), ref_path, ref_text.strip(),
+                                  prompt_lang=lang_of(ref_path),
                                   sample_steps=int(steps), speed_factor=float(speed),
                                   seed=int(seed))
             os.makedirs(tts_dir, exist_ok=True)

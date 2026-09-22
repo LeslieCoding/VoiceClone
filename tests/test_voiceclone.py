@@ -261,13 +261,14 @@ class TestPickReference:
     def test_prefers_5_to_9s(self, tmp_path):
         import vc
         lp = self._mklist(tmp_path, [2.0, 7.0, 14.0])
-        wav, text = vc.pick_reference(lp)
+        wav, text, lang = vc.pick_reference(lp)
         assert "r1" in wav
+        assert lang == "zh"
 
     def test_fallback_when_none_qualified(self, tmp_path):
         import vc
         lp = self._mklist(tmp_path, [1.0, 20.0])
-        wav, text = vc.pick_reference(lp)
+        wav, text, lang = vc.pick_reference(lp)
         assert wav  # 不崩溃，挑最接近的
 
     def test_empty_list_dies(self, tmp_path):
@@ -361,20 +362,22 @@ class TestScanWeights:
         assert [os.path.basename(p) for p in gpts] == ["exp-e5.ckpt", "exp-e15.ckpt"]
 
 
-class TestFindTextInList:
+class TestFindEntryInList:
     def test_finds_by_path(self, tmp_path):
         import vc
         wav = tmp_path / "a.wav"
         wav.write_bytes(b"x")
         lp = tmp_path / "x.list"
-        lp.write_text(f"{wav}|spk|ZH|对应文本\n", encoding="utf-8")
-        assert vc.find_text_in_list(str(lp), str(wav)) == "对应文本"
+        lp.write_text(f"{wav}|spk|EN|对应文本\n", encoding="utf-8")
+        entry = vc.find_entry_in_list(str(lp), str(wav))
+        assert entry[1] == "对应文本"
+        assert entry[2] == "en"
 
     def test_not_found_returns_none(self, tmp_path):
         import vc
         lp = tmp_path / "x.list"
         lp.write_text("D:/y/b.wav|spk|ZH|别的\n", encoding="utf-8")
-        assert vc.find_text_in_list(str(lp), "D:/y/a.wav") is None
+        assert vc.find_entry_in_list(str(lp), "D:/y/a.wav") is None
 
 
 class TestSplitDroppedPaths:

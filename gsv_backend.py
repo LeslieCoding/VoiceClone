@@ -244,35 +244,50 @@ def scan_weights():
 
 # ---------------------------------------------------------------- 推理（电音防线·推理后）
 
-def anti_aliasing_postprocess(audio, sr):
+def anti_aliasing_postprocess(audio, sr, target_rms=0.10, max_gain=6.0):
     """推理输出后处理（电音防线最后一道）：
-    20Hz 高通去直流、16kHz 低通去超高频噪点、软限幅防爆音、峰值归一。"""
+    20Hz 高通去直流 → 软噪声门压底噪 → 响度归一（RMS 目标 + 增益封顶）→ 峰值防爆音。
+    注意：不能用峰值归一！v4 声码器输出电平低（RMS~0.03）且有底噪，
+    峰值归一会把底噪一起放大 30 倍，电音感就是这么来的。"""
     import numpy as np
     from scipy.signal import butter, sosfiltfilt
     audio = np.asarray(audio, dtype=np.float32)
     if len(audio) == 0:
         return audio
     nyq = sr / 2.0
-    sos = butter(4, [20.0 / nyq, min(16000.0, nyq * 0.95) / nyq], btype="band", output="sos")
+    sos = butter(4, 20.0 / nyq, btype="high", output="sos")
     audio = sosfiltfilt(sos, audio).astype(np.float32)
-    audio = np.tanh(audio * 1.05).astype(np.float32)  # 软限幅
+    # 软噪声门：短时 RMS 低于底噪估计 2.5 倍的部分按比例衰减，压制静音段嘶嘶底噪
+    frame = max(int(sr * 0.02), 1)
+    rms_frames = np.sqrt(np.convolve(audio ** 2, np.ones(frame) / frame, mode="same"))
+    noise_floor = float(np.percentile(rms_frames, 20))
+    gate_thresh = max(noise_floor * 2.5, 1e-5)
+    gate_gain = np.clip(rms_frames / gate_thresh, 0.0, 1.0) ** 0.5
+    audio = (audio * np.maximum(gate_gain, 0.1)).astype(np.float32)
+    # 响度归一：RMS 对齐目标值，增益封顶，避免把底噪放大成电音
+    rms = float(np.sqrt(np.mean(audio ** 2)))
+    if rms > 1e-6:
+        audio = (audio * min(target_rms / rms, max_gain)).astype(np.float32)
+    # 峰值防爆音（只在真的爆了时才动）
     peak = float(np.max(np.abs(audio)))
-    if peak > 1e-6:
-        audio = (audio / peak * 0.95).astype(np.float32)
+    if peak > 0.99:
+        audio = (audio / peak * 0.99).astype(np.float32)
     return audio
 
 
 class GsvTTS:
     """GPT-SoVITS v4 推理封装：加载训练出的 SoVITS/GPT 权重做合成"""
 
-    def __init__(self, sovits_path, gpt_path):
+    def __init__(self, sovits_path, gpt_path, fp16=False):
         setup_gsv_path()
         import torch
         from TTS_infer_pack.TTS import TTS, TTS_Config
         cfg = TTS_Config(os.path.join(CONFIGS_DIR, "tts_infer.yaml"))
         cfg.update_version(GSV_VERSION)
         cfg.device = "cuda" if torch.cuda.is_available() else "cpu"
-        cfg.is_half = cfg.device == "cuda"
+        # 默认 fp32 全精度：实测 RTX 5080（Blackwell）上 fp16 推理会让音色相似度
+        # 从 0.30 掉到 0.19（SECS），声码器底噪也会变大，16G 显存跑 fp32 绰绰有余
+        cfg.is_half = fp16 and cfg.device == "cuda"
         cfg.t2s_weights_path = os.path.abspath(gpt_path)
         cfg.vits_weights_path = os.path.abspath(sovits_path)
         cfg.bert_base_path = BERT_DIR

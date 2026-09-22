@@ -202,7 +202,8 @@ def wav_duration(path):
 
 
 def pick_reference(list_path, min_sec=3.0, max_sec=10.0):
-    """从 .list 标注中自动挑选最优参考音：时长 3~10 秒（v4 推理硬性要求）、文本非空，优先 5~9 秒"""
+    """从 .list 标注中自动挑选最优参考音，返回 (音频路径, 文本, 语种)。
+    时长 3~10 秒（v4 推理硬性要求）、文本非空，候选多时按声纹中心度优选。"""
     entries = []
     with open(list_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -212,28 +213,83 @@ def pick_reference(list_path, min_sec=3.0, max_sec=10.0):
                 if not os.path.isabs(wav):
                     wav = os.path.abspath(wav)
                 if os.path.isfile(wav):
-                    entries.append((wav, parts[3]))
+                    entries.append((wav, parts[3], (parts[2] or "zh").lower()))
     if not entries:
         die(f"标注文件 {list_path} 中没有可用的音频条目")
 
     scored = []
-    for wav, text in entries:
+    for wav, text, lang in entries:
         dur = wav_duration(wav)
         if min_sec <= dur <= max_sec:
             # 5~9 秒最优，其余按偏离度扣分
             ideal = 0.0 if 5.0 <= dur <= 9.0 else min(abs(dur - 5.0), abs(dur - 9.0))
-            scored.append((ideal, -dur, wav, text, dur))
+            scored.append((ideal, -dur, wav, text, dur, lang))
     if not scored:
         # 没有合格时放宽到最接近期望区间的
-        cand = [(abs(wav_duration(w) - 7.0), w, t, wav_duration(w)) for w, t in entries]
+        cand = [(abs(wav_duration(w) - 7.0), w, t, wav_duration(w), lg) for w, t, lg in entries]
         cand.sort()
-        _, wav, text, dur = cand[0]
+        _, wav, text, dur, lang = cand[0]
         print(f"提示：没有 3~10 秒的切片，改用时长最接近 7 秒的: {os.path.basename(wav)} ({dur:.1f}s)")
-        return wav, text
+        return wav, text, lang
+    # 时长合格的候选里，优先用声纹中心度挑音色最有代表性的（防"地雷切片"带偏音色）
+    cands = [(s[2], s[3], s[4], s[5]) for s in scored]
+    if len(cands) > 1:
+        picked = _pick_by_centrality([c[0] for c in cands])
+        if picked:
+            wav, text, dur, lang = next(c for c in cands if c[0] == picked)
+            print(f"自动选定参考音频: {wav}\n  时长 {dur:.1f}s | 语种 {lang} | 文本: {text}")
+            return wav, text, lang
     scored.sort()
-    _, _, wav, text, dur = scored[0]
-    print(f"自动选定参考音频: {wav}\n  时长 {dur:.1f}s | 文本: {text}")
-    return wav, text
+    _, _, wav, text, dur, lang = scored[0]
+    print(f"自动选定参考音频: {wav}\n  时长 {dur:.1f}s | 语种 {lang} | 文本: {text}")
+    return wav, text, lang
+
+
+def _pick_by_centrality(wavs):
+    """在候选切片中挑声纹中心度最高的（与其他切片平均余弦相似度最大）。
+    依赖 similarity.py 的 ECAPA 声纹模型；不可用或出错时返回 None，回退时长挑选。
+    embedding 缓存到标注目录 .emb_cache.json（按路径+mtime 失效），避免重复计算。"""
+    try:
+        import json
+        import numpy as np
+        import similarity
+
+        cache_path = os.path.join(ASR_DIR, ".emb_cache.json")
+        cache = {}
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            except Exception:
+                cache = {}
+        embs, changed = [], False
+        for w in wavs:
+            key = os.path.abspath(w)
+            mtime = os.path.getmtime(w)
+            c = cache.get(key)
+            if c and c[0] == mtime:
+                embs.append(np.array(c[1], dtype="float32"))
+            else:
+                e = similarity.speaker_embedding(w)
+                embs.append(e)
+                cache[key] = [mtime, e.tolist()]
+                changed = True
+        if changed:
+            os.makedirs(ASR_DIR, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+        best_i, best_s = -1, -2.0
+        for i, e in enumerate(embs):
+            sims = [float(np.dot(e, o) / (np.linalg.norm(e) * np.linalg.norm(o) + 1e-9))
+                    for j, o in enumerate(embs) if j != i]
+            s = float(np.mean(sims)) if sims else 0.0
+            if s > best_s:
+                best_i, best_s = i, s
+        print(f"声纹优选: {os.path.basename(wavs[best_i])} 中心度 {best_s:.3f}（比较 {len(wavs)} 个候选切片）")
+        return wavs[best_i]
+    except Exception as ex:
+        print(f"提示：声纹优选不可用（{type(ex).__name__}: {ex}），回退按时长挑选")
+        return None
 
 
 # ---------------------------------------------------------------- 推理合成（GPT-SoVITS v4 训练权重）
@@ -260,14 +316,14 @@ def cmd_infer(args):
     if args.ref:
         ref_file = check_file(args.ref, "参考音频")
         ref_text = args.ref_text
-        if ref_text is None and os.path.isfile(list_path):
-            ref_text = find_text_in_list(list_path, ref_file) or ""
+        entry = find_entry_in_list(list_path, ref_file) if os.path.isfile(list_path) else None
         if ref_text is None:
-            ref_text = ""
+            ref_text = (entry[1] if entry else "") or ""
+        ref_lang = entry[2] if entry else "zh"
     else:
         if not os.path.isfile(list_path):
             die(f"标注文件不存在: {list_path}\n请先运行数据准备（菜单选 3），或用 --ref 显式指定参考音频")
-        ref_file, ref_text = pick_reference(list_path)
+        ref_file, ref_text, ref_lang = pick_reference(list_path)
 
     sovits_path, gpt_path = _pick_weights(args)
     os.makedirs(TTS_DIR, exist_ok=True)
@@ -299,7 +355,7 @@ def cmd_infer(args):
 
         out_path = os.path.join(TTS_DIR, f"tts_{idx:04d}.wav")
         print("合成中...", flush=True)
-        sr, audio = tts.synth(gen_text, ref_file, ref_text,
+        sr, audio = tts.synth(gen_text, ref_file, ref_text, prompt_lang=ref_lang,
                               sample_steps=args.steps, speed_factor=args.speed, seed=args.seed)
         sf.write(out_path, audio, sr)
         idx += 1
@@ -309,7 +365,8 @@ def cmd_infer(args):
         print("继续输入下一段文本（空行结束，quit 退出）：")
 
 
-def find_text_in_list(list_path, wav_path):
+def find_entry_in_list(list_path, wav_path):
+    """在标注文件中按音频路径查找条目，返回 (音频路径, 文本, 语种)；找不到返回 None"""
     target = os.path.normcase(os.path.abspath(wav_path))
     with open(list_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -319,7 +376,7 @@ def find_text_in_list(list_path, wav_path):
                 if not os.path.isabs(p):
                     p = os.path.abspath(p)
                 if os.path.normcase(p) == target:
-                    return parts[3]
+                    return p, parts[3], (parts[2] or "zh").lower()
     return None
 
 
