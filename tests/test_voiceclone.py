@@ -376,3 +376,22 @@ class TestSplitDroppedPaths:
         import vc
         line = "'D:/x/one.wav' plain.wav"
         assert vc.split_dropped_paths(line) == ["D:/x/one.wav", "plain.wav"]
+
+
+class TestWriteList:
+    def test_overwrite_default(self, tmp_path):
+        lp = str(tmp_path / "a.list")
+        ss._write_list(lp, ["x1|s|ZH|一"])
+        ss._write_list(lp, ["x2|s|ZH|二"])
+        assert open(lp, encoding="utf-8").read() == "x2|s|ZH|二\n"
+
+    def test_append_merges(self, tmp_path):
+        lp = str(tmp_path / "a.list")
+        ss._write_list(lp, ["x1|s|ZH|一"])
+        ss._write_list(lp, ["x2|s|ZH|二"], append=True)
+        assert open(lp, encoding="utf-8").read() == "x1|s|ZH|一\nx2|s|ZH|二\n"
+
+    def test_append_to_missing_file_just_writes(self, tmp_path):
+        lp = str(tmp_path / "a.list")
+        ss._write_list(lp, ["x1|s|ZH|一"], append=True)
+        assert open(lp, encoding="utf-8").read() == "x1|s|ZH|一\n"

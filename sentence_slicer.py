@@ -98,8 +98,9 @@ def _snap_to_silence(rms, hop, t_sec, search=0.3, thr_ratio=3.0):
 
 
 def sentence_slice(vocal_path, out_dir, list_path, model_size=WHISPER_MODEL,
-                   speaker=None, _max=0.9, alpha=0.25, verbose=True):
-    """句子级切分整条音频，写出切片 wav 和 .list 标注，返回 (切片数, list_path)"""
+                   speaker=None, _max=0.9, alpha=0.25, verbose=True, append=False):
+    """句子级切分整条音频，写出切片 wav 和 .list 标注，返回 (切片数, list_path)。
+    append=True 时把新条目追加到已有 .list（多音源批量处理用），否则覆盖重写。"""
     from faster_whisper import WhisperModel
     from asr import _add_torch_dll_dir
     import librosa
@@ -149,7 +150,16 @@ def sentence_slice(vocal_path, out_dir, list_path, model_size=WHISPER_MODEL,
         if verbose:
             print(f"  [{idx+1:03d}] {start:7.2f}s ~ {end:7.2f}s ({end-start:4.1f}s) | {text[:50]}")
 
-    with open(list_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    _write_list(list_path, lines, append=append)
     print(f"切分完成：{len(lines)} 个片段，标注文件: {list_path}")
     return len(lines), os.path.abspath(list_path)
+
+
+def _write_list(list_path, lines, append=False):
+    """写 .list 标注；append=True 时追加到已有内容之后"""
+    if append and os.path.isfile(list_path):
+        with open(list_path, "r", encoding="utf-8") as f:
+            old_lines = [ln.rstrip("\n") for ln in f if ln.strip()]
+        lines = old_lines + lines
+    with open(list_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")

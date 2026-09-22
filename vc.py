@@ -83,15 +83,45 @@ class Stager:
 # ---------------------------------------------------------------- 数据准备
 
 def cmd_prepare(args):
-    import separate
-    import sentence_slicer
     import annotate
 
-    st = Stager(5 if not args.skip_uvr else 3)
-    src = os.path.abspath(args.source)
-    if not os.path.isfile(src):
-        die(f"音源文件不存在: {src}")
+    sources = args.source if isinstance(args.source, list) else [args.source]
+    multi = len(sources) > 1
+    for i, src in enumerate(sources):
+        src = os.path.abspath(src)
+        if not os.path.isfile(src):
+            if not multi:
+                die(f"音源文件不存在: {src}")
+            print(f"\n[提示] 音源文件不存在，跳过: {src}")
+            continue
+        if multi:
+            print(f"\n{'~'*15} 第 {i+1}/{len(sources)} 个音源: {os.path.basename(src)} {'~'*15}")
+        # 多文件时：第一个文件清空旧标注，之后的追加合并，最后统一标注一次
+        try:
+            _prepare_one(src, args, append_list=(multi and i > 0))
+        except (SystemExit, Exception) as e:
+            if not multi:
+                raise
+            print(f"\n[提示] 该音源处理失败（{e}），继续处理下一个。")
 
+    st = Stager(1)
+    # 标注确认（唯一需要人工确认的环节）
+    st.next("标注确认")
+    check_file(DEFAULT_LIST, "ASR 标注文件(.list)")
+    annotate.run_annotator(DEFAULT_LIST, port=SUBFIX_PORT)
+
+    st.next("完成")
+    n_total = len(annotate.load_list(DEFAULT_LIST))
+    print(f"数据准备完成！标注文件共 {n_total} 个句子片段: {DEFAULT_LIST}")
+    print("接下来可直接运行推理: vc.py infer")
+
+
+def _prepare_one(src, args, append_list=False):
+    """单个音源的 分离 → 去混响 → 切分+识别；append_list=True 时标注追加到已有列表"""
+    import separate
+    import sentence_slicer
+
+    st = Stager(3 if not args.skip_uvr else 1)
     # [1] 人声分离（MelBand RoFormer）
     if args.skip_uvr:
         st.next("人声分离（--skip-uvr，跳过）")
@@ -115,16 +145,9 @@ def cmd_prepare(args):
     if n_old > 0:
         print(f"提示：输出目录 {SLICER_DIR} 已有 {n_old} 个 wav 文件，新切片将与其并存（如需干净数据请先手动清空）。")
     n_slices, list_path = sentence_slicer.sentence_slice(
-        vocal_path, SLICER_DIR, DEFAULT_LIST, model_size=args.whisper_model)
+        vocal_path, SLICER_DIR, DEFAULT_LIST, model_size=args.whisper_model,
+        append=append_list)
     check_file(list_path, "ASR 标注文件(.list)")
-
-    # [4] 标注确认（唯一需要人工确认的环节）
-    st.next("标注确认")
-    annotate.run_annotator(list_path, port=SUBFIX_PORT)
-
-    st.next("完成")
-    print(f"数据准备完成！共 {n_slices} 个句子片段，标注文件: {list_path}")
-    print("接下来可直接运行推理: vc.py infer")
 
 
 # ---------------------------------------------------------------- 参考音频挑选
@@ -356,16 +379,10 @@ def wizard():
                 if not srcs:
                     continue
                 if len(srcs) > 1:
-                    print(f"共 {len(srcs)} 个音源，将依次处理。")
+                    print(f"共 {len(srcs)} 个音源，将依次处理，最后统一标注。")
                 pure = input("音源是否已是纯人声（无背景音乐）？[y/N]: ").strip().lower() == "y"
-                for i, s in enumerate(srcs, 1):
-                    if len(srcs) > 1:
-                        print(f"\n{'~'*15} 第 {i}/{len(srcs)} 个音源: {os.path.basename(s)} {'~'*15}")
-                    args = argparse.Namespace(source=s, skip_uvr=pure, whisper_model="large-v3-turbo")
-                    try:
-                        cmd_prepare(args)
-                    except (SystemExit, Exception) as e:
-                        print(f"\n[提示] 该音源处理失败（{e}），继续处理下一个。")
+                args = argparse.Namespace(source=srcs, skip_uvr=pure, whisper_model="large-v3-turbo")
+                cmd_prepare(args)
             elif choice == "4":
                 import annotate
                 list_path = check_file(DEFAULT_LIST, "标注文件(.list)")
@@ -387,7 +404,7 @@ def main():
     sub = p.add_subparsers(dest="command")
 
     p_prepare = sub.add_parser("prepare", help="数据准备（分离/去混响/切分/识别/标注）")
-    p_prepare.add_argument("source", help="音源文件路径")
+    p_prepare.add_argument("source", nargs="+", help="音源文件路径（可多个，将依次处理后统一标注）")
     p_prepare.add_argument("--skip-uvr", action="store_true", help="输入已是纯人声，跳过分离和去混响")
     p_prepare.add_argument("--whisper-model", default="large-v3-turbo",
                            help="Whisper 识别模型（默认 large-v3-turbo，可换 large-v3）")

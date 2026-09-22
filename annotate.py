@@ -150,8 +150,8 @@ def run_annotator(list_path, port=9871):
     port = find_free_port(port)
     demo.launch(server_name="0.0.0.0", server_port=port, inbrowser=True,
                 prevent_thread_lock=True, quiet=True)
-    print(f"标注网页已启动: http://localhost:{port}")
-    print("在浏览器中校对，完成后点击页面底部的「完成并关闭」。")
+    print(f"标注网页已启动: http://localhost:{port}", flush=True)
+    print("在浏览器中校对，完成后点击页面底部的「完成并关闭」。", flush=True)
     try:
         while not done_event.wait(1.0):
             pass
