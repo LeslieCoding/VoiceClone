@@ -345,3 +345,34 @@ class TestFindTextInList:
         lp = tmp_path / "x.list"
         lp.write_text("D:/y/b.wav|spk|ZH|别的\n", encoding="utf-8")
         assert vc.find_text_in_list(str(lp), "D:/y/a.wav") is None
+
+
+class TestSplitDroppedPaths:
+    def test_single_quoted(self):
+        import vc
+        assert vc.split_dropped_paths('"D:/a/b c.wav"') == ["D:/a/b c.wav"]
+
+    def test_multiple_quoted(self):
+        import vc
+        line = '"D:/x/钢铁侠2.wav" "D:/x/Jarvis001.wav" "D:/x/复联1.wav"'
+        assert vc.split_dropped_paths(line) == [
+            "D:/x/钢铁侠2.wav", "D:/x/Jarvis001.wav", "D:/x/复联1.wav"]
+
+    def test_unquoted_existing_file_with_space(self, tmp_path):
+        import vc
+        f = tmp_path / "my voice.wav"
+        f.write_bytes(b"x")
+        assert vc.split_dropped_paths(str(f)) == [str(f)]
+
+    def test_unquoted_nonexistent_falls_back_to_tokens(self):
+        import vc
+        assert vc.split_dropped_paths("a.wav b.wav") == ["a.wav", "b.wav"]
+
+    def test_empty(self):
+        import vc
+        assert vc.split_dropped_paths("   ") == []
+
+    def test_mixed_quotes(self):
+        import vc
+        line = "'D:/x/one.wav' plain.wav"
+        assert vc.split_dropped_paths(line) == ["D:/x/one.wav", "plain.wav"]

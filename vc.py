@@ -304,6 +304,20 @@ def cmd_all(args):
 
 # ---------------------------------------------------------------- 向导菜单
 
+def split_dropped_paths(line):
+    """把拖入窗口的一行拆成路径列表：支持多个带引号路径、单个未加引号含空格路径"""
+    line = line.strip()
+    if not line:
+        return []
+    # 整行去掉首尾引号后就是一个存在的文件（未加引号但路径含空格的情况）
+    single = line.strip('"').strip("'")
+    if os.path.isfile(single):
+        return [single]
+    # 否则按引号/空格拆成多个
+    tokens = re.findall(r'"([^"]+)"|\'([^\']+)\'|([^\s"\']+)', line)
+    return [next(g for g in m if g) for m in tokens]
+
+
 def wizard():
     while True:
         print("\n" + "=" * 50)
@@ -329,10 +343,29 @@ def wizard():
             elif choice == "2":
                 cmd_ui(argparse.Namespace(port=None, share=False))
             elif choice == "3":
-                src = input("请输入音源文件路径（可直接拖入窗口）: ").strip().strip('"')
+                srcs = split_dropped_paths(input("请输入音源文件路径（可一次拖入多个文件）: "))
+                if not srcs:
+                    print("未输入路径。")
+                    continue
+                missing = [s for s in srcs if not os.path.isfile(s)]
+                if missing:
+                    print("以下文件不存在，将跳过：")
+                    for m in missing:
+                        print(f"  {m}")
+                    srcs = [s for s in srcs if os.path.isfile(s)]
+                if not srcs:
+                    continue
+                if len(srcs) > 1:
+                    print(f"共 {len(srcs)} 个音源，将依次处理。")
                 pure = input("音源是否已是纯人声（无背景音乐）？[y/N]: ").strip().lower() == "y"
-                args = argparse.Namespace(source=src, skip_uvr=pure, whisper_model="large-v3-turbo")
-                cmd_prepare(args)
+                for i, s in enumerate(srcs, 1):
+                    if len(srcs) > 1:
+                        print(f"\n{'~'*15} 第 {i}/{len(srcs)} 个音源: {os.path.basename(s)} {'~'*15}")
+                    args = argparse.Namespace(source=s, skip_uvr=pure, whisper_model="large-v3-turbo")
+                    try:
+                        cmd_prepare(args)
+                    except (SystemExit, Exception) as e:
+                        print(f"\n[提示] 该音源处理失败（{e}），继续处理下一个。")
             elif choice == "4":
                 import annotate
                 list_path = check_file(DEFAULT_LIST, "标注文件(.list)")
