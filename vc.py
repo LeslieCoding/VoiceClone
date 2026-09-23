@@ -161,7 +161,7 @@ def _prepare_one(src, args, append_list=False):
     import separate
     import sentence_slicer
 
-    st = Stager(3 if not args.skip_uvr else 1)
+    st = Stager(4 if not args.skip_uvr else 3)
     # [1] 人声分离（MelBand RoFormer）
     if args.skip_uvr:
         st.next("人声分离（--skip-uvr，跳过）")
@@ -179,7 +179,17 @@ def _prepare_one(src, args, append_list=False):
         shutil.copyfile(deref, vocal_path)
         print(f"干净人声: {vocal_path}")
 
-    # [3] 句子级智能切分（含语音识别，完整句子不切断，音调相近的句子贴在一起）
+    # [3] 深度降噪（DeepFilterNet3）：分离残留/原音本身的底噪会烙进训练数据和参考音，
+    # 切片越干净，训练出的模型和最终合成的杂音越少
+    st.next("深度降噪（DeepFilterNet，去除残留杂音）")
+    import soundfile as sf
+    import gsv_backend as gb
+    audio, sr = sf.read(vocal_path, dtype="float32")
+    audio = gb.df_denoise(audio, sr)
+    sf.write(vocal_path, audio, sr)
+    print(f"深度降噪完成: {vocal_path}")
+
+    # [4] 句子级智能切分（含语音识别，完整句子不切断，音调相近的句子贴在一起）
     st.next("句子级智能切分 + 语音识别")
     n_old = len(glob.glob(os.path.join(SLICER_DIR, "*.wav")))
     if n_old > 0:
