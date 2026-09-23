@@ -365,8 +365,15 @@ def cmd_infer(args):
 
         out_path = os.path.join(TTS_DIR, f"tts_{idx:04d}.wav")
         print("合成中...", flush=True)
-        sr, audio = tts.synth(gen_text, ref_file, ref_text, prompt_lang=ref_lang,
-                              sample_steps=args.steps, speed_factor=args.speed, seed=args.seed)
+        best_of = getattr(args, "best_of", 2)
+        if best_of > 1 and args.seed < 0:
+            # 多候选选优：流匹配有随机性，个别种子会出"灾难代"，自动挑综合分最高的
+            sr, audio = tts.synth_best(gen_text, ref_file, ref_text, n=best_of,
+                                       prompt_lang=ref_lang,
+                                       sample_steps=args.steps, speed_factor=args.speed)
+        else:
+            sr, audio = tts.synth(gen_text, ref_file, ref_text, prompt_lang=ref_lang,
+                                  sample_steps=args.steps, speed_factor=args.speed, seed=args.seed)
         sf.write(out_path, audio, sr)
         idx += 1
         print(f"已保存: {out_path}\n")
@@ -412,7 +419,7 @@ def cmd_all(args):
     cmd_train(train_args)
     print("\n训练完成，进入推理合成。")
     infer_args = argparse.Namespace(list=DEFAULT_LIST, ref=None, ref_text=None, text=None,
-                                    sovits=None, gpt=None, steps=64, speed=1.0, seed=-1)
+                                    sovits=None, gpt=None, steps=128, speed=1.0, seed=-1, best_of=2)
     cmd_infer(infer_args)
 
 
@@ -455,7 +462,7 @@ def wizard():
                 cmd_ui(argparse.Namespace(port=None, share=False))
             elif choice == "2":
                 args = argparse.Namespace(list=None, ref=None, ref_text=None, text=None,
-                                          sovits=None, gpt=None, steps=64, speed=1.0, seed=-1)
+                                          sovits=None, gpt=None, steps=128, speed=1.0, seed=-1, best_of=2)
                 cmd_infer(args)
             elif choice == "3":
                 exp = input("实验名称（回车默认 exp1，权重按此名保存）: ").strip() or "exp1"
@@ -524,7 +531,9 @@ def main():
     p_infer.add_argument("--sovits", help="SoVITS 权重路径（默认最新）")
     p_infer.add_argument("--gpt", help="GPT 权重路径（默认最新）")
     p_infer.add_argument("--text", action="append", help="要合成的文本（可多次指定；不指定则进入交互输入）")
-    p_infer.add_argument("--steps", type=int, default=64, help="CFM 采样步数（默认 64，低了有电音）")
+    p_infer.add_argument("--steps", type=int, default=128, help="CFM 采样步数（默认 128，低了有电音/金属杂音）")
+    p_infer.add_argument("--best-of", type=int, default=2, dest="best_of",
+                         help="多候选选优：每段生成 N 个候选自动挑最佳（默认 2，1=关闭；指定 --seed 时自动关闭）")
     p_infer.add_argument("--speed", type=float, default=1.0, help="语速（默认 1.0）")
     p_infer.add_argument("--seed", type=int, default=-1, help="随机种子（-1 随机）")
 

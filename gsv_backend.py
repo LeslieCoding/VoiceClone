@@ -255,7 +255,8 @@ def df_denoise(audio, sr):
     import torch
     from df.enhance import enhance, init_df
     if _DF_STATE is None:
-        _DF_STATE = init_df()
+        # post_filter=True：额外压制降噪后的音乐噪声（musical noise），实测对金属杂音更有效
+        _DF_STATE = init_df(post_filter=True)
     model, df_state, _ = _DF_STATE
     target_sr = df_state.sr()
     audio = np.asarray(audio, dtype="float32")
@@ -326,9 +327,10 @@ class GsvTTS:
         self.tts = TTS(cfg)
 
     def synth(self, text, ref_audio, prompt_text, prompt_lang="zh", text_lang="zh",
-              sample_steps=64, top_k=15, top_p=1.0, temperature=1.0,
+              sample_steps=128, top_k=15, top_p=1.0, temperature=1.0,
               speed_factor=1.0, seed=-1, postprocess=True, denoise=True):
-        """合成一段文本，返回 (采样率, float32 波形)。sample_steps 默认 64（官方 32 有电音感）"""
+        """合成一段文本，返回 (采样率, float32 波形)。
+        sample_steps 默认 128：实测 64 步有残留金属杂音，128 步噪声更低、SECS 更高（官方 32 更差）"""
         inputs = {
             "text": text, "text_lang": text_lang,
             "ref_audio_path": ref_audio,
@@ -346,3 +348,44 @@ class GsvTTS:
         if postprocess:
             audio = anti_aliasing_postprocess(audio, sr)
         return sr, audio
+
+    def synth_best(self, text, ref_audio, prompt_text, n=2, **kw):
+        """多候选自动选优：流匹配合成有随机性，个别种子会产出"灾难代"（金属杂音爆发、
+        SECS 掉到 0 以下）。生成 n 个不同种子的候选，按 SECS声纹相似度 - 噪声惩罚 综合分
+        选最佳返回 (采样率, 波形)。评测模型不可用时不选优，直接返回首个候选。"""
+        cands = []
+        for i in range(max(int(n), 1)):
+            sr, audio = self.synth(text, ref_audio, prompt_text, **kw)
+            cands.append((sr, audio))
+        if len(cands) == 1:
+            return cands[0]
+        try:
+            import os
+            import tempfile
+            import numpy as np
+            import soundfile as sf
+            import librosa
+            import similarity
+            e_ref = similarity.speaker_embedding(ref_audio)
+            best, best_score = cands[0], -9e9
+            for sr, audio in cands:
+                tmp = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                        tmp = f.name
+                    sf.write(tmp, audio, sr)
+                    e = similarity.speaker_embedding(tmp)
+                finally:
+                    if tmp and os.path.isfile(tmp):
+                        os.unlink(tmp)
+                s = float(np.dot(e_ref, e) / (np.linalg.norm(e_ref) * np.linalg.norm(e) + 1e-9))
+                fl = float(np.mean(librosa.feature.spectral_flatness(y=np.asarray(audio, dtype="float32"))))
+                score = s - 2.0 * fl  # 噪声惩罚：金属/嘶嘶杂音会让频谱平坦度升高
+                print(f"  候选评分: SECS={s:.3f} 平坦度={fl:.4f} 综合={score:.3f}", flush=True)
+                if score > best_score:
+                    best, best_score = (sr, audio), score
+            print(f"已选最优候选（综合分 {best_score:.3f}）", flush=True)
+            return best
+        except Exception as ex:
+            print(f"提示：候选选优不可用（{type(ex).__name__}: {ex}），使用第一个候选")
+            return cands[0]

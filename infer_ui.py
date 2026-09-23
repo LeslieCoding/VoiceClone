@@ -134,8 +134,8 @@ def run_ui(list_path, tts_dir, port=9873):
             gen_box = gr.Textbox(label="要合成的文本（支持多行）", lines=5,
                                  placeholder="在这里输入你想让它说的话……")
             with gr.Accordion("高级参数（一般用默认值即可）", open=False):
-                steps_sl = gr.Slider(16, 128, value=64, step=8,
-                                     label="采样步数（低于 64 可能有电音，越大越慢）")
+                steps_sl = gr.Slider(16, 256, value=128, step=8,
+                                     label="采样步数（默认 128 最干净，调低更快但可能有杂音）")
                 speed_sl = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label="语速")
                 seed_num = gr.Number(value=-1, label="随机种子（-1 = 随机）")
             synth_btn = gr.Button("开始合成", variant="primary", size="lg")
