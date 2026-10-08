@@ -260,6 +260,12 @@ def df_denoise(audio, sr):
     model, df_state, _ = _DF_STATE
     target_sr = df_state.sr()
     audio = np.asarray(audio, dtype="float32")
+    # 多声道（如 UVR/去混响输出的 44.1k 立体声）先混合为单声道：
+    # DeepFilterNet 的 Rust STFT 只接受 2D [C, T]，立体声直接 unsqueeze 会变 3D 崩溃；
+    # 人声干声左右基本同相，混合还能顺带压一点底噪，且后续重采样/降噪工作量减半
+    if audio.ndim > 1:
+        ch_axis = 0 if audio.shape[0] <= 8 else -1
+        audio = audio.mean(axis=ch_axis).astype("float32")
     if sr != target_sr:
         import librosa
         audio_in = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
